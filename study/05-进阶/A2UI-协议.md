@@ -581,6 +581,16 @@ func renderSessionHistory(w io.Writer, sessionID string, history []*schema.Messa
 
 ## 6. 前端集成
 
+> **完整 Demo**：[a2ui-demo/index.html](a2ui-demo/index.html)
+>
+> 该文件包含完整的 A2UI 前端实现：
+> - 会话管理（侧边栏）
+> - A2UI 组件树渲染（Column/Card/Row/Text）
+> - 数据绑定增量更新
+> - 中断审批 UI
+> - SSE 流式消息处理
+> - 文件上传支持
+
 ### 6.1 JavaScript SSE 客户端
 
 ```javascript
@@ -914,6 +924,243 @@ export function A2UIChat() {
         </div>
     );
 }
+```
+
+### 6.3 Vue 3 集成
+
+```vue
+<template>
+  <div class="a2ui-chat">
+    <div class="a2ui-messages">
+      <template v-if="rootId">
+        <component
+          v-for="id in getChildren(rootId)"
+          :key="id"
+          :is="'render-' + getComponentType(id)"
+          :id="id"
+        />
+      </template>
+    </div>
+
+    <!-- 中断审批对话框 -->
+    <div v-if="pendingInterrupt" class="a2ui-interrupt">
+      <p>{{ pendingInterrupt.desc }}</p>
+      <button @click="handleInterruptResponse(true)">批准</button>
+      <button @click="handleInterruptResponse(false)">拒绝</button>
+    </div>
+
+    <!-- 输入区域 -->
+    <div class="a2ui-input">
+      <input v-model="inputMessage" @keyup.enter="sendMessage" placeholder="输入消息..." />
+      <button @click="sendMessage">发送</button>
+    </div>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { ref, reactive, computed, onMounted } from 'vue'
+
+// 类型定义
+interface A2UIMessage {
+  beginRendering?: { surfaceId: string; root: string }
+  surfaceUpdate?: { surfaceId: string; components: any[] }
+  dataModelUpdate?: { surfaceId: string; contents: any[] }
+  interruptRequest?: { interruptId: string; description: string }
+}
+
+interface Component {
+  id: string
+  component: {
+    Text?: { value?: string; dataKey?: string; usageHint?: string }
+    Column?: { children: string[] }
+    Row?: { children: string[] }
+    Card?: { children: string[] }
+  }
+}
+
+// 状态
+const surfaceId = ref('chat-' + Math.random().toString(36).slice(2))
+const rootId = ref<string | null>(null)
+const components = reactive<Record<string, Component>>({})
+const dataModel = reactive<Record<string, string>>({})
+const pendingInterrupt = ref<{ id: string; desc: string } | null>(null)
+const inputMessage = ref('')
+
+// 获取组件类型
+const getComponentType = (id: string): string => {
+  const comp = components[id]?.component
+  if (comp?.Text) return 'text'
+  if (comp?.Column) return 'column'
+  if (comp?.Row) return 'row'
+  if (comp?.Card) return 'card'
+  return 'div'
+}
+
+// 获取子组件
+const getChildren = (id: string): string[] => {
+  const comp = components[id]?.component
+  return comp?.Column?.children || comp?.Row?.children || comp?.Card?.children || []
+}
+
+// 获取文本内容
+const getTextContent = (id: string): string => {
+  const comp = components[id]?.component
+  if (comp?.Text) {
+    return comp.Text.dataKey ? dataModel[comp.Text.dataKey] || '' : comp.Text.value || ''
+  }
+  return ''
+}
+
+// 获取样式类
+const getTextClass = (id: string): string => {
+  const comp = components[id]?.component
+  const hint = comp?.Text?.usageHint || 'body'
+  return `a2ui-text a2ui-text--${hint}`
+}
+
+// 发送消息
+const sendMessage = async () => {
+  if (!inputMessage.value.trim()) return
+  await connect(inputMessage.value)
+  inputMessage.value = ''
+}
+
+// 连接并处理流
+const connect = async (message: string) => {
+  const response = await fetch(
+    `http://localhost:8080/stream?session=${surfaceId.value}&message=${encodeURIComponent(message)}`
+  )
+
+  const reader = response.body?.getReader()
+  if (!reader) return
+
+  const decoder = new TextDecoder()
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+
+    const text = decoder.decode(value)
+    const lines = text.split('\n').filter(Boolean)
+
+    for (const line of lines) {
+      try {
+        const msg: A2UIMessage = JSON.parse(line)
+        handleMessage(msg)
+      } catch (e) {
+        console.error('解析错误:', e)
+      }
+    }
+  }
+}
+
+// 处理消息
+const handleMessage = (msg: A2UIMessage) => {
+  if (msg.beginRendering) {
+    rootId.value = msg.beginRendering.root
+  }
+
+  if (msg.surfaceUpdate) {
+    for (const comp of msg.surfaceUpdate.components) {
+      components[comp.id] = comp
+    }
+  }
+
+  if (msg.dataModelUpdate) {
+    for (const c of msg.dataModelUpdate.contents) {
+      dataModel[c.key] = c.valueString
+    }
+  }
+
+  if (msg.interruptRequest) {
+    pendingInterrupt.value = {
+      id: msg.interruptRequest.interruptId,
+      desc: msg.interruptRequest.description,
+    }
+  }
+}
+
+// 审批响应
+const handleInterruptResponse = async (approved: boolean) => {
+  await fetch('http://localhost:8080/resume', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      interruptId: pendingInterrupt.value?.id,
+      approved,
+    }),
+  })
+  pendingInterrupt.value = null
+}
+
+// 组件注册
+const RenderText = {
+  props: ['id'],
+  setup(props: { id: string }) {
+    return () => {
+      const content = getTextContent(props.id)
+      const cls = getTextClass(props.id)
+      return `<span class="${cls}">${content}</span>`
+    }
+  }
+}
+
+onMounted(() => {
+  // 可以自动连接或等待用户输入
+})
+</script>
+
+<style scoped>
+.a2ui-chat {
+  max-width: 800px;
+  margin: 0 auto;
+  padding: 20px;
+}
+.a2ui-messages {
+  margin-bottom: 20px;
+}
+.a2ui-column,
+.a2ui-row {
+  display: flex;
+  flex-direction: column;
+}
+.a2ui-row {
+  flex-direction: row;
+}
+.a2ui-card {
+  border: 1px solid #e0e0e0;
+  border-radius: 8px;
+  padding: 12px;
+  margin: 8px 0;
+}
+.a2ui-text--title {
+  font-size: 18px;
+  font-weight: bold;
+}
+.a2ui-text--caption {
+  font-size: 12px;
+  color: #666;
+}
+.a2ui-text--body {
+  font-size: 14px;
+}
+.a2ui-interrupt {
+  background: #fff3cd;
+  padding: 16px;
+  border-radius: 8px;
+  margin: 16px 0;
+}
+.a2ui-input {
+  display: flex;
+  gap: 8px;
+}
+.a2ui-input input {
+  flex: 1;
+  padding: 8px 12px;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+}
+</style>
 ```
 
 ---
